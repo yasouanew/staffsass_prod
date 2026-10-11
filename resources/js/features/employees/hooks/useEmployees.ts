@@ -1,0 +1,617 @@
+import {
+    keepPreviousData,
+    useMutation,
+    useQuery,
+    useQueryClient,
+    type UseMutationResult,
+    type UseQueryResult,
+} from '@tanstack/react-query';
+
+import {
+    apiClient,
+    type ApiSuccessResponse,
+    type PaginatedCollection,
+} from '@/lib/api-client';
+import { SUBSCRIPTION_KEYS } from '@/features/billing/hooks/useSubscription';
+import {
+    NO_DEPARTMENT_LABEL,
+    type CreateEmployeeInput,
+    type Employee,
+    type EmployeeInvitation,
+    type EmployeeListParams,
+    type EmployeeRole,
+    type EmployeeStats,
+    type EmployeeStatus,
+    type EmploymentType,
+    type InvitationChannel,
+    type SendInvitationInput,
+    type SendInvitationResult,
+    type UpdateEmployeeInput,
+} from '@/types/employee';
+
+
+
+/**
+ * Data-access layer for the Employee Directory.
+ *
+ * All transport concerns live here behind the exported hooks: components call
+ * {@link useEmployees} / {@link useCreateEmployee} and never touch Axios or the
+ * backend DTO shape directly. Server responses (Laravel API Resources) are
+ * mapped into the app's stable {@link Employee} domain type before they ever
+ * reach the presentation layer.
+ */
+
+/**
+ * Refresh the live active-user seat usage cache after a seat-affecting employee
+ * mutation.
+ *
+ * A seat is one *active user account* in the company (see the per-seat billing
+ * definition). Adding a member who becomes active, re-activating a deactivated
+ * member, or deactivating/revoking one all change that count. The seat-usage
+ * badge on the directory reads the billing usage query
+ * (`SUBSCRIPTION_KEYS.usage`, exposed through `useSeatCapacity`), so those
+ * mutations must invalidate it — otherwise the badge keeps showing a stale
+ * "used of limit" until a manual reload.
+ *
+ * Invalidating the key also lets the next capacity pre-flight
+ * (`seatCapacity.isFull`) and the Add/Edit seat warnings read fresh numbers the
+ * moment the mutation completes. This helper is a safe no-op for roles that
+ * cannot read billing usage (the query never mounts for them).
+ */
+function refreshSeatUsage(queryClient: ReturnType<typeof useQueryClient>): void {
+    void queryClient.invalidateQueries({ queryKey: SUBSCRIPTION_KEYS.usage });
+}
+
+/** Query cache key namespace for employee data. */
+export const EMPLOYEES_QUERY_KEY = ['employees'] as const;
+
+/** Key registry so each filtered directory read is cached independently. */
+export const EMPLOYEES_KEYS = {
+    all: EMPLOYEES_QUERY_KEY,
+    list: (params: EmployeeListParams) => ['employees', 'list', params] as const,
+    detail: (id: string) => ['employees', 'detail', id] as const,
+} as const;
+
+/* -------------------------------------------------------------------------- */
+/* Transport DTOs (mirror of the backend EmployeeResource)                    */
+/* -------------------------------------------------------------------------- */
+
+/** Minimal `{ id, name }` shape shared by department/position/branch relations. */
+interface NamedRefDto {
+    id: number;
+    name: string;
+}
+
+/** Subset of the linked user account exposed on an employee. */
+interface EmployeeUserDto {
+    id: number;
+    name: string;
+    email: string;
+    role?: string | null;
+    phone?: string | null;
+}
+
+/** Raw invitation payload as serialized by `EmployeeInvitationResource`. */
+interface EmployeeInvitationDto {
+    email: string;
+    role: string;
+    channel: string;
+    status: string;
+    expires_at: string | null;
+    last_sent_at: string | null;
+}
+
+
+/** Raw employee payload as serialized by `EmployeeResource`. */
+interface EmployeeDto {
+    id: number;
+    first_name: string;
+    last_name: string;
+    full_name: string | null;
+    employee_number: string | null;
+    employment_type: string | null;
+    dob: string | null;
+    gender: string | null;
+    address: string | null;
+    emergency_contact: string | null;
+    emergency_phone: string | null;
+    hire_date: string | null;
+    termination_date: string | null;
+    hourly_rate: string | number | null;
+    photo_url: string | null;
+    status: string | null;
+    user?: EmployeeUserDto | null;
+    department?: NamedRefDto | null;
+    position?: NamedRefDto | null;
+    branch?: NamedRefDto | null;
+    invitation?: EmployeeInvitationDto | null;
+    created_at: string | null;
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* DTO -> domain mapping                                                      */
+/* -------------------------------------------------------------------------- */
+
+/** Coerce an arbitrary backend status into the UI's status union. */
+function normalizeStatus(raw: string | null | undefined): EmployeeStatus {
+    switch (raw) {
+        case 'active':
+            return 'active';
+        case 'pending':
+        case 'invited':
+            return 'pending';
+        case 'terminated':
+            return 'terminated';
+        default:
+            return 'inactive';
+    }
+}
+
+
+/** Coerce a backend employment type into the UI union, defaulting sensibly. */
+function normalizeEmploymentType(raw: string | null | undefined): EmploymentType {
+    switch (raw) {
+        case 'part_time':
+        case 'casual':
+        case 'contract':
+        case 'contractor':
+            return raw;
+        default:
+            return 'full_time';
+    }
+}
+
+/** Coerce a backend role string into the UI union, or `null` when unknown. */
+function normalizeRole(raw: string | null | undefined): EmployeeRole | null {
+    switch (raw) {
+        case 'company_admin':
+        case 'scheduler':
+        case 'employee':
+            return raw;
+        default:
+            return null;
+    }
+}
+
+/**
+ * Map the invitation relation, dropping anything unrecognised.
+ *
+ * Returning `null` for an absent or malformed payload keeps the row menu's
+ * "Send invite" vs "Resend invite" decision a simple null check.
+ */
+function mapInvitation(dto: EmployeeInvitationDto | null | undefined): EmployeeInvitation | null {
+    if (!dto) return null;
+
+    const status =
+        dto.status === 'pending' || dto.status === 'expired' || dto.status === 'accepted'
+            ? dto.status
+            : null;
+
+    if (status === null) return null;
+
+    return {
+        status,
+        channel: (dto.channel === 'web' ? 'web' : 'mobile') satisfies InvitationChannel,
+        role: normalizeRole(dto.role) ?? 'employee',
+        email: dto.email,
+        lastSentAt: dto.last_sent_at,
+        expiresAt: dto.expires_at,
+    };
+}
+
+/**
+ * Convert a raw {@link EmployeeDto} into the stable {@link Employee} domain
+ * shape. `joinedDate` is guaranteed to be a valid ISO date so downstream
+ * `parseISO`/`format` calls in the table never receive an invalid value.
+ *
+ * Branch data is preserved as a real `{ id, name }` pair so the directory can
+ * filter by branch and deep-link into `/branches/:id`.
+ */
+function mapEmployee(dto: EmployeeDto): Employee {
+    const fullName =
+        dto.full_name?.trim() ||
+        `${dto.first_name ?? ''} ${dto.last_name ?? ''}`.trim() ||
+        dto.user?.name ||
+        'Unnamed employee';
+
+    return {
+        id: String(dto.id),
+        name: fullName,
+        email: dto.user?.email ?? '',
+        avatarUrl: dto.photo_url ?? undefined,
+        position: dto.position?.name ?? '—',
+        // The department name is shown verbatim; each company defines its own.
+        department: dto.department?.name ?? NO_DEPARTMENT_LABEL,
+        departmentId: dto.department ? String(dto.department.id) : null,
+        branchId: dto.branch ? String(dto.branch.id) : null,
+
+        branchName: dto.branch?.name ?? null,
+        status: normalizeStatus(dto.status),
+        joinedDate: dto.hire_date ?? dto.created_at ?? new Date().toISOString(),
+        positionId: dto.position ? String(dto.position.id) : null,
+        employmentType: normalizeEmploymentType(dto.employment_type),
+        hourlyRate: dto.hourly_rate === null || dto.hourly_rate === undefined
+            ? null
+            : String(dto.hourly_rate),
+        // Prefer the live role on the linked user account, because that is the
+        // authoritative source once an account exists. The invitation's `role`
+        // is only a snapshot taken when the invite was sent (and re-sends); it is
+        // never rewritten when an admin later changes the role through the edit
+        // dialog, so preferring it would make a successful role update look like
+        // it silently reverted. Only fall back to it while the person has not
+        // accepted and therefore has no user record to read from.
+        role: normalizeRole(dto.user?.role ?? dto.invitation?.role),
+        invitation: mapInvitation(dto.invitation),
+        // Remaining profile fields exposed by `EmployeeResource`.
+        employeeNumber: dto.employee_number ?? null,
+        phone: dto.user?.phone ?? null,
+        dob: dto.dob ?? null,
+        gender: dto.gender ?? null,
+        address: dto.address ?? null,
+        emergencyContact: dto.emergency_contact ?? null,
+        emergencyPhone: dto.emergency_phone ?? null,
+        hireDate: dto.hire_date ?? null,
+        terminationDate: dto.termination_date ?? null,
+    };
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* Transport functions                                                        */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * GET /api/v1/employees — returns the mapped directory collection.
+ *
+ * Branch/status narrowing is delegated to the backend so large directories are
+ * never transferred in full just to be filtered on the client.
+ */
+async function fetchEmployees(params: EmployeeListParams = {}): Promise<Employee[]> {
+    const response = await apiClient.get<ApiSuccessResponse<PaginatedCollection<EmployeeDto>>>(
+        '/employees',
+        {
+            params: {
+                branch_id: params.branchId || undefined,
+                department_id: params.departmentId || undefined,
+                status: params.status || undefined,
+                per_page: params.perPage ?? 100,
+            },
+
+        },
+    );
+
+    return response.data.data.data.map(mapEmployee);
+}
+
+/**
+ * POST /api/v1/employees/invite — creates a new employee *with a login*.
+ *
+ * The `invite` endpoint is used rather than the plain `employees` store route
+ * because only the former also provisions the linked user account, assigns the
+ * chosen role and emails an invitation to set a password. Posting to
+ * `/employees` would create a profile with no credentials, so the selected role
+ * would grant no access and the person could never sign in.
+ *
+ * The current {@link CreateEmployeeInput} carries a human-readable name; the
+ * backend derives the owning company from the authenticated user, so we split
+ * the display name into first/last and forward the assignment foreign keys.
+ */
+async function createEmployee(input: CreateEmployeeInput): Promise<Employee> {
+    const [firstName, ...rest] = input.name.trim().split(/\s+/);
+    const lastName = rest.join(' ') || firstName;
+
+    const response = await apiClient.post<ApiSuccessResponse<EmployeeDto>>('/employees/invite', {
+        first_name: firstName,
+        last_name: lastName,
+        email: input.email,
+        // Drives what the person can reach once they accept the invitation.
+        role: input.role,
+        // Assignments are persisted as foreign keys; sending names silently discards them.
+        department_id: input.departmentId ? Number(input.departmentId) : null,
+        position_id: input.positionId ? Number(input.positionId) : null,
+        branch_id: input.branchId ? Number(input.branchId) : null,
+        // Backend accepts `full_time,part_time,casual,contractor` on invite.
+        employment_type: input.employmentType,
+        hourly_rate: input.hourlyRate.trim() === '' ? null : Number(input.hourlyRate),
+        phone: input.phone.trim() === '' ? null : input.phone.trim(),
+    });
+
+    return mapEmployee(response.data.data);
+}
+
+
+/**
+ * PUT /api/v1/employees/{employee} — persists profile edits from the row menu.
+ *
+ * Empty selects are sent as `null` rather than omitted so clearing an
+ * assignment actually unsets the foreign key instead of silently keeping the
+ * previous value.
+ */
+async function updateEmployee({
+    employeeId,
+    input,
+}: {
+    employeeId: string;
+    input: UpdateEmployeeInput;
+}): Promise<Employee> {
+    const response = await apiClient.put<ApiSuccessResponse<EmployeeDto>>(
+        `/employees/${employeeId}`,
+        {
+            first_name: input.firstName.trim(),
+            last_name: input.lastName.trim(),
+            // Applied to the linked `users` row by `EmployeeService::update()`;
+            // the employee profile itself has no role column.
+            role: input.role,
+            department_id: input.departmentId ? Number(input.departmentId) : null,
+            position_id: input.positionId ? Number(input.positionId) : null,
+            branch_id: input.branchId ? Number(input.branchId) : null,
+            employment_type: input.employmentType,
+            hourly_rate: input.hourlyRate.trim() === '' ? null : Number(input.hourlyRate),
+            status: input.status,
+            // Profile fields accepted by `UpdateEmployeeRequest`. Note: `phone`
+            // is deliberately omitted — the update endpoint has no rule for it,
+            // so it would be silently discarded (phone lives on the user record
+            // and is only settable via the invite payload).
+            employee_number: input.employeeNumber.trim() === '' ? null : input.employeeNumber.trim(),
+            dob: input.dob.trim() === '' ? null : input.dob.trim(),
+            gender: input.gender.trim() === '' ? null : input.gender.trim(),
+            address: input.address.trim() === '' ? null : input.address.trim(),
+            emergency_contact: input.emergencyContact.trim() === '' ? null : input.emergencyContact.trim(),
+            emergency_phone: input.emergencyPhone.trim() === '' ? null : input.emergencyPhone.trim(),
+            hire_date: input.hireDate.trim() === '' ? null : input.hireDate.trim(),
+            termination_date: input.terminationDate.trim() === '' ? null : input.terminationDate.trim(),
+        },
+    );
+
+    return mapEmployee(response.data.data);
+}
+
+/**
+ * POST /api/v1/employees/{employee}/invitation — sends (or re-sends) the
+ * onboarding email.
+ *
+ * The backend picks the journey from the role: `company_admin`/`scheduler` get a
+ * link into this web app's set-password screen, while `employee` receives a
+ * "download the app" email and verifies by emailed code on their phone. The
+ * resolved channel comes back so the caller can show an accurate toast.
+ */
+async function sendInvitation({
+    employeeId,
+    input,
+}: {
+    employeeId: string;
+    input: SendInvitationInput;
+}): Promise<SendInvitationResult> {
+    const response = await apiClient.post<ApiSuccessResponse<EmployeeInvitationDto>>(
+        `/employees/${employeeId}/invitation`,
+        {
+            role: input.role,
+            // Omit rather than send an empty string: the invitee keeps whatever
+            // address their account already has.
+            email: input.email.trim() === '' ? undefined : input.email.trim(),
+        },
+    );
+
+    const invitation = response.data.data;
+
+    return {
+        channel: invitation.channel === 'web' ? 'web' : 'mobile',
+        email: invitation.email,
+    };
+}
+
+/** GET /api/v1/employees/{employee} — a single mapped employee record. */
+
+async function fetchEmployee(employeeId: string): Promise<Employee> {
+    const response = await apiClient.get<ApiSuccessResponse<EmployeeDto>>(
+        `/employees/${employeeId}`,
+    );
+
+    return mapEmployee(response.data.data);
+}
+
+/**
+ * POST /api/v1/employees/{employee}/photo — uploads (or replaces) a profile
+ * photo. Sent as multipart form data so Axios sets the `Content-Type` boundary
+ * automatically; the backend rule requires `photo: image|jpg,jpeg,png,webp|max:2048`.
+ */
+async function uploadEmployeePhoto(employeeId: string, file: File): Promise<Employee> {
+    const formData = new FormData();
+    formData.append('photo', file);
+
+    const response = await apiClient.post<ApiSuccessResponse<EmployeeDto>>(
+        `/employees/${employeeId}/photo`,
+        formData,
+    );
+
+    return mapEmployee(response.data.data);
+}
+
+/** Derives aggregate KPI counters from an employee collection. */
+export function deriveEmployeeStats(employees: readonly Employee[]): EmployeeStats {
+    return employees.reduce<EmployeeStats>(
+        (acc, employee) => {
+            acc.total += 1;
+            if (employee.status === 'active') acc.active += 1;
+            if (employee.status === 'pending') acc.pending += 1;
+            return acc;
+        },
+        { total: 0, active: 0, pending: 0 },
+    );
+}
+
+/* -------------------------------------------------------------------------- */
+/* Hooks                                                                      */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Reads the employee directory, optionally scoped to a branch. Returns the
+ * standard TanStack Query result so the UI can branch on
+ * `isLoading` / `isError` / `data` cleanly, preserving the existing loading
+ * skeletons, empty states and error boundaries. Previous data is kept while a
+ * new filter loads to avoid a jarring table flash.
+ */
+export function useEmployees(params: EmployeeListParams = {}): UseQueryResult<Employee[], Error> {
+    return useQuery<Employee[], Error>({
+        queryKey: EMPLOYEES_KEYS.list(params),
+        queryFn: () => fetchEmployees(params),
+        placeholderData: keepPreviousData,
+        staleTime: 30_000,
+    });
+}
+
+/**
+ * Reads a single employee for detail screens (e.g. the availability editor's
+ * page header). Disabled until the route param resolves.
+ */
+export function useEmployee(employeeId: string): UseQueryResult<Employee, Error> {
+    return useQuery<Employee, Error>({
+        queryKey: EMPLOYEES_KEYS.detail(employeeId),
+        queryFn: () => fetchEmployee(employeeId),
+        enabled: employeeId.length > 0,
+        staleTime: 30_000,
+    });
+}
+
+/**
+ * Creates a new employee and invalidates the directory cache on success so the
+ * table and KPI counters refresh automatically.
+ */
+export function useCreateEmployee(): UseMutationResult<Employee, Error, CreateEmployeeInput> {
+    const queryClient = useQueryClient();
+
+    return useMutation<Employee, Error, CreateEmployeeInput>({
+        mutationFn: createEmployee,
+        onSuccess: () => {
+            void queryClient.invalidateQueries({ queryKey: EMPLOYEES_KEYS.all });
+            // The new member is created `pending` with an outstanding invitation
+            // (no seat yet) — refresh the seat count so the badge and capacity
+            // pre-flights read the authoritative value.
+            refreshSeatUsage(queryClient);
+        },
+    });
+}
+
+/** Variables accepted by {@link useUpdateEmployee}. */
+export interface UpdateEmployeeVariables {
+    employeeId: string;
+    input: UpdateEmployeeInput;
+}
+
+/**
+ * Saves profile edits for one employee, then refreshes every cached directory
+ * view so the table row, KPI counters and any open detail screen all reflect the
+ * change without a manual reload.
+ */
+export function useUpdateEmployee(): UseMutationResult<Employee, Error, UpdateEmployeeVariables> {
+    const queryClient = useQueryClient();
+
+    return useMutation<Employee, Error, UpdateEmployeeVariables>({
+        mutationFn: updateEmployee,
+        onSuccess: (employee) => {
+            queryClient.setQueryData(EMPLOYEES_KEYS.detail(employee.id), employee);
+            void queryClient.invalidateQueries({ queryKey: EMPLOYEES_KEYS.all });
+            // A status save can move a real (accepted) member onto `active`
+            // (seat consumed) or off it (seat freed via
+            // `EmployeeService::syncAccountAccess()`); hand-flipping a member
+            // whose invitation is still outstanding is refused with
+            // INVITATION_PENDING. Refresh the seat count so the badge reflects
+            // the transition.
+            refreshSeatUsage(queryClient);
+        },
+    });
+}
+
+/** Variables accepted by {@link useUploadEmployeePhoto}. */
+export interface UploadEmployeePhotoVariables {
+    employeeId: string;
+    file: File;
+}
+
+/**
+ * Uploads a profile photo for one employee, then refreshes the cached directory
+ * so the avatar shown in the table updates without a reload.
+ */
+export function useUploadEmployeePhoto(): UseMutationResult<
+    Employee,
+    Error,
+    UploadEmployeePhotoVariables
+> {
+    const queryClient = useQueryClient();
+
+    return useMutation<Employee, Error, UploadEmployeePhotoVariables>({
+        mutationFn: ({ employeeId, file }) => uploadEmployeePhoto(employeeId, file),
+        onSuccess: (employee) => {
+            queryClient.setQueryData(EMPLOYEES_KEYS.detail(employee.id), employee);
+            void queryClient.invalidateQueries({ queryKey: EMPLOYEES_KEYS.all });
+        },
+    });
+}
+
+/** Variables accepted by {@link useSendInvitation}. */
+export interface SendInvitationVariables {
+    employeeId: string;
+    input: SendInvitationInput;
+}
+
+/**
+ * Sends the onboarding email for one employee.
+ *
+ * The directory cache is invalidated on success because inviting someone also
+ * flips their invitation state (and may create their login), which the row's
+ * status column and menu labels read from.
+ */
+export function useSendInvitation(): UseMutationResult<
+    SendInvitationResult,
+    Error,
+    SendInvitationVariables
+> {
+    const queryClient = useQueryClient();
+
+    return useMutation<SendInvitationResult, Error, SendInvitationVariables>({
+        mutationFn: sendInvitation,
+        onSuccess: () => {
+            void queryClient.invalidateQueries({ queryKey: EMPLOYEES_KEYS.all });
+            // (Re)sending an invitation keeps the member `pending` (no seat);
+            // they take a seat only when they accept and set a password —
+            // refresh the seat count so the badge stays authoritative.
+            refreshSeatUsage(queryClient);
+        },
+    });
+}
+
+// Revoke invite feature disabled.
+// /**
+//  * DELETE /api/v1/employees/{employee}/invitation — makes an outstanding
+//  * invitation inert.
+//  *
+//  * The backend clears every secret (web token, mobile code, setup token) so any
+//  * previously emailed link or code stops working, while the ledger row itself is
+//  * kept for the audit trail. Returns 404 when there is no invitation to revoke.
+//  */
+// async function revokeInvitation(employeeId: string): Promise<void> {
+//     await apiClient.delete(`/employees/${employeeId}/invitation`);
+// }
+
+// /**
+//  * Revokes one employee's outstanding invitation.
+//  *
+//  * The directory cache is invalidated on success because revoking clears the
+//  * invitation state, which the row menu reads to decide between "Send invite",
+//  * "Resend invite" and "Revoke invite".
+//  */
+// export function useRevokeInvitation(): UseMutationResult<void, Error, string> {
+//     const queryClient = useQueryClient();
+
+//     return useMutation<void, Error, string>({
+//         mutationFn: revokeInvitation,
+//         onSuccess: () => {
+//             void queryClient.invalidateQueries({ queryKey: EMPLOYEES_KEYS.all });
+//             // Revoking can flip an active seat holder back to a non-seat state —
+//             // refresh the seat count so the badge reflects the freed seat.
+//             refreshSeatUsage(queryClient);
+//         },
+//     });
+// }
+
